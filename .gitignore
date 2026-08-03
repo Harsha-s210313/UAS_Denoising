@@ -1,0 +1,13 @@
+# Bytecode and compiled files
+__pycache__/
+*.pyc
+*.pyo
+
+# Data files and generated synthetic outputs
+*.dat
+signal_generation/Synthetic_Data/
+
+*.png
+*.pth
+code/Results/
+code/models/
