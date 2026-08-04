@@ -1,91 +1,118 @@
-
 import os
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, random_split
-from config import Config
-from dataset import SyntheticUNetDataset
-from unet import Configurable1DUNet
-from utils import set_seed
+from torch.utils.data import DataLoader
 
-def pretrain_denoiser():
-    set_seed(Config.SEED)
-    os.makedirs(Config.MODEL_DIR, exist_ok=True)
-    
-    print(f"--- Phase 1: U-Net Pre-training on Synthetic Data Starting on {Config.DEVICE} ---")
-    
-    # 1. Load Synthetic Dataset (Requires root_dir with 'clean/' and 'noisy/' subfolders)
-    dataset = SyntheticUNetDataset(Config.SYNTHETIC_DATA_DIR, Config.SIGNAL_LENGTH)
-    if len(dataset) == 0:
-        print(f"Error: No synthetic dataset found at {Config.SYNTHETIC_DATA_DIR}")
-        return
+# Import project modules
+from config import TRAIN_CONFIG
+from unet import UNetDenoiser
+from dataset import SignalDataset
 
-    train_size = int(Config.TRAIN_VAL_SPLIT * len(dataset))
-    val_size = len(dataset) - train_size
-    train_dataset, val_dataset = random_split(
-        dataset, [train_size, val_size], generator=torch.Generator().manual_seed(Config.SEED)
-    )
+# 1. Enable Autograd Anomaly Detection to trace any NaNs or Infs back to source
+torch.autograd.set_detect_anomaly(True)
 
-    train_loader = DataLoader(train_dataset, batch_size=Config.UNET_BATCH_SIZE, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=Config.UNET_BATCH_SIZE, shuffle=False)
 
-    # 2. Initialize Model
-    model = Configurable1DUNet(Config.UNET_CONFIG).to(Config.DEVICE)
-    criterion = nn.MSELoss() # Supervised MSE: Comparing output directly to clean ground truth
-    optimizer = torch.optim.Adam(model.parameters(), lr=Config.UNET_LR)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', patience=3, factor=0.5)
+class SafeDenoisingLoss(nn.Module):
+    """
+    Robust loss wrapper that prevents zero-division and log(0) instabilities.
+    Compares reconstructed signal against clean ground truth target.
+    """
+    def __init__(self, eps=1e-8):
+        super(SafeDenoisingLoss, self).__init__()
+        self.eps = eps
+        self.mse = nn.MSELoss()
 
-    best_val_loss = float('inf')
-    patience_counter = 0
-    save_path = os.path.join(Config.MODEL_DIR, "unet_pretrained.pth")
+    def forward(self, pred, target):
+        # Guarantee inputs are finite before loss computation
+        if not torch.isfinite(pred).all() or not torch.isfinite(target).all():
+            raise ValueError("Non-finite values detected in model prediction or ground truth target.")
 
-    for epoch in range(1, Config.PRETRAIN_EPOCHS + 1):
-        model.train()
+        # Primary MSE loss calculation
+        loss = self.mse(pred, target)
+
+        # Numerical guard: avoid log(0) or division by zero if computing relative loss
+        loss = torch.clamp(loss, min=self.eps)
+        return loss
+
+
+def normalize_batch(x, eps=1e-8):
+    """
+    Normalizes each signal sample in the batch to zero mean and unit variance.
+    Prevents large dynamic range mismatches in real trial data.
+    """
+    mean = x.mean(dim=-1, keepdim=True)
+    std = x.std(dim=-1, keepdim=True)
+    # Add epsilon to prevent division by zero on silent/flat signal frames
+    return (x - mean) / (std + eps)
+
+
+def train_denoiser():
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Executing denoiser pretraining on device: {device}")
+
+    # Load configuration
+    batch_size = TRAIN_CONFIG.get("batch_size", 32)
+    epochs = TRAIN_CONFIG.get("epochs", 50)
+    # Conservative learning rate to prevent optimizer instability
+    learning_rate = TRAIN_CONFIG.get("learning_rate", 1e-4)
+
+    # Initialize Dataset and DataLoader
+    train_dataset = SignalDataset(mode="pretrain")
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+
+    # Initialize UNet Model, Loss, and Optimizer
+    model = UNetDenoiser().to(device)
+    criterion = SafeDenoisingLoss(eps=1e-8)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=1e-4)
+
+    model.train()
+    for epoch in range(1, epochs + 1):
         running_loss = 0.0
-        
-        for noisy_batch, clean_batch in train_loader:
-            noisy_batch = noisy_batch.to(Config.DEVICE)
-            clean_batch = clean_batch.to(Config.DEVICE)
-            
+
+        for batch_idx, (noisy_signals, clean_signals) in enumerate(train_loader):
+            noisy_signals = noisy_signals.to(device)
+            clean_signals = clean_signals.to(device)
+
+            # 2. Normalize inputs to constrain dynamic range across real/trial data
+            noisy_signals = normalize_batch(noisy_signals)
+            clean_signals = normalize_batch(clean_signals)
+
+            # Sanity check for data bounds on initial batch
+            if epoch == 1 and batch_idx == 0:
+                print(f"[Sanity Check] Noisy Max: {noisy_signals.max().item():.4f}, "
+                      f"Min: {noisy_signals.min().item():.4f}, "
+                      f"Has NaN: {torch.isnan(noisy_signals).any().item()}")
+
             optimizer.zero_grad()
-            outputs = model(noisy_batch)
-            
-            # Loss minimizes difference between network reconstruction and pure synthetic clean signal
-            loss = criterion(outputs, clean_batch)
+
+            # 3. Disable Mixed Precision (AMP) force FP32 execution for stability
+            with torch.cuda.amp.autocast(enabled=False):
+                predictions = model(noisy_signals.float())
+                loss = criterion(predictions, clean_signals.float())
+
+            # Catch infinite loss immediately before backward step
+            if not torch.isfinite(loss):
+                print(f"CRITICAL ERROR: Infinite loss encountered at Epoch {epoch}, Batch {batch_idx}")
+                print(f"Prediction range: [{predictions.min()}, {predictions.max()}]")
+                raise RuntimeError("Training aborted due to non-finite loss.")
+
             loss.backward()
+
+            # 4. Gradient Clipping: Prevent exploding gradients in UNet skip connections
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
             optimizer.step()
-            
-            running_loss += loss.item() * noisy_batch.size(0)
+            running_loss += loss.item()
 
-        train_loss = running_loss / len(train_dataset)
+        epoch_loss = running_loss / len(train_loader)
+        print(f"Epoch [{epoch}/{epochs}] - Loss: {epoch_loss:.6f}")
 
-        # Validation Phase
-        model.eval()
-        val_loss = 0.0
-        with torch.no_grad():
-            for noisy_batch, clean_batch in val_loader:
-                noisy_batch = noisy_batch.to(Config.DEVICE)
-                clean_batch = clean_batch.to(Config.DEVICE)
-                
-                outputs = model(noisy_batch)
-                loss = criterion(outputs, clean_batch)
-                val_loss += loss.item() * noisy_batch.size(0)
+    # Save stable checkpoint
+    os.makedirs("code/models", exist_ok=True)
+    save_path = "code/models/unet_pretrained.pth"
+    torch.save(model.state_dict(), save_path)
+    print(f"Pretraining complete. Checkpoint saved to {save_path}")
 
-        val_loss /= len(val_dataset)
-        scheduler.step(val_loss)
-
-        print(f"Epoch {epoch:02d}/{Config.PRETRAIN_EPOCHS:02d} | Train Loss: {train_loss:.6f} | Val Loss: {val_loss:.6f}")
-
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            patience_counter = 0
-            torch.save(model.state_dict(), save_path)
-            print(f"--> Saved Pre-trained U-Net Checkpoint to {save_path}")
-        else:
-            patience_counter += 1
-            if patience_counter >= Config.UNET_PATIENCE:
-                print(f"Early stopping triggered at Epoch {epoch}.")
-                break
 
 if __name__ == "__main__":
-    pretrain_denoiser()
+    train_denoiser()
