@@ -1,6 +1,16 @@
 import os
+import random
+
+# Intel Xeon OpenMP thread optimization for multi-socket execution
+os.environ["OMP_NUM_THREADS"] = "16"
+os.environ["MKL_NUM_THREADS"] = "16"
+os.environ["MKL_DYNAMIC"] = "FALSE"
+
 import torch
 import torch.nn as nn
+
+torch.set_num_threads(16)
+
 from config import Config
 from dataset import TrialDetectorDataset
 from detector import Configurable1DCNN
@@ -8,7 +18,7 @@ from torch.utils.data import DataLoader, Subset
 from utils import compute_classification_metrics, set_seed
 
 
-def pri_grouped_split(dataset, train_ratio=0.8):
+def pri_grouped_split(dataset, train_ratio=0.8, seed=42):
     signal_pri_groups = {}
     noise_pri_groups = {}
 
@@ -26,9 +36,13 @@ def pri_grouped_split(dataset, train_ratio=0.8):
             noise_pri_groups[pri_folder].append(idx)
 
     def split_groups(group_dict):
-        sorted_keys = sorted(list(group_dict.keys()))
-        num_train = max(1, int(len(sorted_keys) * train_ratio))
-        train_keys = set(sorted_keys[:num_train])
+        keys = list(group_dict.keys())
+        # Seeded shuffle prevents alphabetical folder bias across splits
+        random.seed(seed)
+        random.shuffle(keys)
+
+        num_train = max(1, int(len(keys) * train_ratio))
+        train_keys = set(keys[:num_train])
 
         t_idx, v_idx = [], []
         for key, indices in group_dict.items():
@@ -63,21 +77,21 @@ def train_detector():
         return
 
     train_dataset, val_dataset = pri_grouped_split(
-        full_dataset, Config.TRAIN_VAL_SPLIT
+        full_dataset, Config.TRAIN_VAL_SPLIT, seed=Config.SEED
     )
 
     train_loader = DataLoader(
-        train_dataset, batch_size=Config.DETECTOR_BATCH_SIZE, shuffle=True
+        train_dataset, batch_size=Config.DETECTOR_BATCH_SIZE, shuffle=True, num_workers=2, drop_last=False
     )
     val_loader = DataLoader(
-        val_dataset, batch_size=Config.DETECTOR_BATCH_SIZE, shuffle=False
+        val_dataset, batch_size=Config.DETECTOR_BATCH_SIZE, shuffle=False, num_workers=2, drop_last=False
     )
 
     model = Configurable1DCNN(Config.DETECTOR_CONFIG).to(Config.DEVICE)
-    criterion = nn.BCELoss()
+    criterion = nn.BCEWithLogitsLoss()
 
     optimizer = torch.optim.Adam(
-        model.parameters(), lr=Config.DETECTOR_LR, weight_decay=1e-4
+        model.parameters(), lr=Config.DETECTOR_LR, weight_decay=1e-3
     )
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode="min", patience=3, factor=0.5
@@ -89,6 +103,7 @@ def train_detector():
     save_path = os.path.join(Config.MODEL_DIR, "detector_best.pth")
 
     for epoch in range(1, Config.DETECTOR_EPOCHS + 1):
+        # --- Training Phase ---
         model.train()
         running_loss = 0.0
         for x_batch, y_batch in train_loader:
@@ -96,10 +111,11 @@ def train_detector():
             y_batch = y_batch.to(Config.DEVICE).view(-1)
 
             optimizer.zero_grad()
-            preds = model(x_batch).view(-1)
-            preds = torch.clamp(preds, 1e-7, 1.0 - 1e-7)
 
-            loss = criterion(preds, y_batch)
+            raw_preds = model(x_batch).view(-1)
+            raw_preds = torch.clamp(raw_preds, min=-15.0, max=15.0)
+
+            loss = criterion(raw_preds, y_batch)
             loss.backward()
 
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -109,6 +125,7 @@ def train_detector():
 
         train_loss = running_loss / len(train_dataset)
 
+        # --- Validation Phase ---
         model.eval()
         val_loss = 0.0
         all_targets = []
@@ -119,14 +136,16 @@ def train_detector():
                 x_batch = x_batch.to(Config.DEVICE)
                 y_batch = y_batch.to(Config.DEVICE).view(-1)
 
-                preds = model(x_batch).view(-1)
-                preds = torch.clamp(preds, 1e-7, 1.0 - 1e-7)
+                raw_preds = model(x_batch).view(-1)
+                raw_preds = torch.clamp(raw_preds, min=-15.0, max=15.0)
 
-                loss = criterion(preds, y_batch)
+                loss = criterion(raw_preds, y_batch)
                 val_loss += loss.item() * x_batch.size(0)
 
-                all_targets.extend(y_batch.cpu().numpy())
-                all_preds.extend(preds.cpu().numpy())
+                probs = torch.sigmoid(raw_preds)
+
+                all_targets.extend(y_batch.float().cpu().numpy())
+                all_preds.extend(probs.float().cpu().numpy())
 
         val_loss /= len(val_dataset)
         scheduler.step(val_loss)
@@ -155,11 +174,11 @@ def train_detector():
 
     if best_metrics:
         print("\n--- Final Best Model Validation Evaluation ---")
-        print(f"Accuracy:        {best_metrics['accuracy']:.4f}")
-        print(f"Precision:       {best_metrics['precision']:.4f}")
-        print(f"Recall:          {best_metrics['recall']:.4f}")
-        print(f"F1-Score:        {best_metrics['f1_score']:.4f}")
-        print(f"ROC-AUC:         {best_metrics['roc_auc']:.4f}")
+        print(f"Accuracy:         {best_metrics['accuracy']:.4f}")
+        print(f"Precision:        {best_metrics['precision']:.4f}")
+        print(f"Recall:           {best_metrics['recall']:.4f}")
+        print(f"F1-Score:         {best_metrics['f1_score']:.4f}")
+        print(f"ROC-AUC:          {best_metrics['roc_auc']:.4f}")
         print("Confusion Matrix:")
         print(best_metrics["confusion_matrix"])
         print("---------------------------------------------\n")
