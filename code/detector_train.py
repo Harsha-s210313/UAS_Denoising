@@ -1,187 +1,121 @@
 import os
-import random
-
-# Intel Xeon OpenMP thread optimization for multi-socket execution
-os.environ["OMP_NUM_THREADS"] = "16"
-os.environ["MKL_NUM_THREADS"] = "16"
-os.environ["MKL_DYNAMIC"] = "FALSE"
-
 import torch
 import torch.nn as nn
-
-torch.set_num_threads(16)
-
+from torch.utils.data import DataLoader, random_split
 from config import Config
-from dataset import TrialDetectorDataset
-from detector import Configurable1DCNN
-from torch.utils.data import DataLoader, Subset
-from utils import compute_classification_metrics, set_seed
-
-
-def pri_grouped_split(dataset, train_ratio=0.8, seed=42):
-    signal_pri_groups = {}
-    noise_pri_groups = {}
-
-    for idx, filepath in enumerate(dataset.file_list):
-        label = dataset.labels[idx]
-        pri_folder = os.path.basename(os.path.dirname(filepath))
-
-        if label == 1.0:
-            if pri_folder not in signal_pri_groups:
-                signal_pri_groups[pri_folder] = []
-            signal_pri_groups[pri_folder].append(idx)
-        else:
-            if pri_folder not in noise_pri_groups:
-                noise_pri_groups[pri_folder] = []
-            noise_pri_groups[pri_folder].append(idx)
-
-    def split_groups(group_dict):
-        keys = list(group_dict.keys())
-        # Seeded shuffle prevents alphabetical folder bias across splits
-        random.seed(seed)
-        random.shuffle(keys)
-
-        num_train = max(1, int(len(keys) * train_ratio))
-        train_keys = set(keys[:num_train])
-
-        t_idx, v_idx = [], []
-        for key, indices in group_dict.items():
-            if key in train_keys:
-                t_idx.extend(indices)
-            else:
-                v_idx.extend(indices)
-        return t_idx, v_idx
-
-    sig_train, sig_val = split_groups(signal_pri_groups)
-    noise_train, noise_val = split_groups(noise_pri_groups)
-
-    train_indices = sig_train + noise_train
-    val_indices = sig_val + noise_val
-
-    return Subset(dataset, train_indices), Subset(dataset, val_indices)
+from dataset import SignalDetectionDataset
+from detector import SignalDetectorCNN
+from utils import set_seed, compute_classification_metrics
 
 
 def train_detector():
     set_seed(Config.SEED)
     os.makedirs(Config.MODEL_DIR, exist_ok=True)
 
-    print(f"--- Stage 1: Detector Training Starting on {Config.DEVICE} ---")
+    print(f"--- Stage 1: Detector Training Starting on [{Config.DEVICE}] ---")
 
-    full_dataset = TrialDetectorDataset(
-        Config.TRIAL_DATA_DIR, Config.SIGNAL_LENGTH
+    dataset = SignalDetectionDataset(
+        Config.SYNTHETIC_DATA_DIR,
+        signal_length=Config.SIGNAL_LENGTH,
+        is_complex=Config.IS_COMPLEX_SIGNAL,
     )
-    if len(full_dataset) == 0:
-        print(
-            f"Error: No trial data found in directory: {Config.TRIAL_DATA_DIR}"
-        )
+
+    if len(dataset) == 0:
+        print(f"Error: No detector dataset found in {Config.SYNTHETIC_DATA_DIR}")
         return
 
-    train_dataset, val_dataset = pri_grouped_split(
-        full_dataset, Config.TRAIN_VAL_SPLIT, seed=Config.SEED
+    train_size = int(Config.TRAIN_VAL_SPLIT * len(dataset))
+    val_size = len(dataset) - train_size
+    train_dataset, val_dataset = random_split(
+        dataset,
+        [train_size, val_size],
+        generator=torch.Generator().manual_seed(Config.SEED),
     )
 
     train_loader = DataLoader(
-        train_dataset, batch_size=Config.DETECTOR_BATCH_SIZE, shuffle=True, num_workers=2, drop_last=False
+        train_dataset,
+        batch_size=Config.DETECTOR_BATCH_SIZE,
+        shuffle=True,
+        num_workers=0,
     )
     val_loader = DataLoader(
-        val_dataset, batch_size=Config.DETECTOR_BATCH_SIZE, shuffle=False, num_workers=2, drop_last=False
+        val_dataset,
+        batch_size=Config.DETECTOR_BATCH_SIZE,
+        shuffle=False,
+        num_workers=0,
     )
 
-    model = Configurable1DCNN(Config.DETECTOR_CONFIG).to(Config.DEVICE)
-    criterion = nn.BCEWithLogitsLoss()
-
+    model = SignalDetectorCNN(Config.DETECTOR_CONFIG).to(Config.DEVICE)
+    criterion = nn.BCELoss()
     optimizer = torch.optim.Adam(
-        model.parameters(), lr=Config.DETECTOR_LR, weight_decay=1e-3
+        model.parameters(), lr=Config.DETECTOR_LR
     )
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode="min", patience=3, factor=0.5
     )
 
     best_val_loss = float("inf")
-    best_metrics = None
     patience_counter = 0
-    save_path = os.path.join(Config.MODEL_DIR, "detector_best.pth")
+    save_path = os.path.join(Config.MODEL_DIR, "detector_model.pth")
 
     for epoch in range(1, Config.DETECTOR_EPOCHS + 1):
-        # --- Training Phase ---
         model.train()
         running_loss = 0.0
+
         for x_batch, y_batch in train_loader:
             x_batch = x_batch.to(Config.DEVICE)
-            y_batch = y_batch.to(Config.DEVICE).view(-1)
+            y_batch = y_batch.to(Config.DEVICE)
 
             optimizer.zero_grad()
-
-            raw_preds = model(x_batch).view(-1)
-            raw_preds = torch.clamp(raw_preds, min=-15.0, max=15.0)
-
-            loss = criterion(raw_preds, y_batch)
+            preds = model(x_batch)
+            loss = criterion(preds, y_batch)
             loss.backward()
-
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
 
             running_loss += loss.item() * x_batch.size(0)
 
         train_loss = running_loss / len(train_dataset)
 
-        # --- Validation Phase ---
         model.eval()
         val_loss = 0.0
-        all_targets = []
-        all_preds = []
+        val_preds = []
+        val_targets = []
 
         with torch.no_grad():
             for x_batch, y_batch in val_loader:
                 x_batch = x_batch.to(Config.DEVICE)
-                y_batch = y_batch.to(Config.DEVICE).view(-1)
+                y_batch = y_batch.to(Config.DEVICE)
 
-                raw_preds = model(x_batch).view(-1)
-                raw_preds = torch.clamp(raw_preds, min=-15.0, max=15.0)
-
-                loss = criterion(raw_preds, y_batch)
+                preds = model(x_batch)
+                loss = criterion(preds, y_batch)
                 val_loss += loss.item() * x_batch.size(0)
 
-                probs = torch.sigmoid(raw_preds)
-
-                all_targets.extend(y_batch.float().cpu().numpy())
-                all_preds.extend(probs.float().cpu().numpy())
+                val_preds.extend(preds.cpu().numpy())
+                val_targets.extend(y_batch.cpu().numpy())
 
         val_loss /= len(val_dataset)
         scheduler.step(val_loss)
 
         metrics = compute_classification_metrics(
-            list(all_targets), list(all_preds), Config.DETECTOR_THRESHOLD
+            val_targets, val_preds, threshold=Config.DETECTOR_THRESHOLD
         )
 
         print(
             f"Epoch {epoch:02d}/{Config.DETECTOR_EPOCHS:02d} | "
             f"Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | "
-            f"Val Acc: {metrics['accuracy']:.4f} | Val AUC: {metrics['roc_auc']:.4f}"
+            f"Val Acc: {metrics['accuracy']:.4f} | F1: {metrics['f1_score']:.4f}"
         )
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
-            best_metrics = metrics
             patience_counter = 0
             torch.save(model.state_dict(), save_path)
-            print(f"--> Saved Best Model Checkpoint to {save_path}")
+            print(f"--> Saved Best Detector Weights to {save_path}")
         else:
             patience_counter += 1
             if patience_counter >= Config.DETECTOR_PATIENCE:
                 print(f"Early stopping triggered at Epoch {epoch}.")
                 break
-
-    if best_metrics:
-        print("\n--- Final Best Model Validation Evaluation ---")
-        print(f"Accuracy:         {best_metrics['accuracy']:.4f}")
-        print(f"Precision:        {best_metrics['precision']:.4f}")
-        print(f"Recall:           {best_metrics['recall']:.4f}")
-        print(f"F1-Score:         {best_metrics['f1_score']:.4f}")
-        print(f"ROC-AUC:          {best_metrics['roc_auc']:.4f}")
-        print("Confusion Matrix:")
-        print(best_metrics["confusion_matrix"])
-        print("---------------------------------------------\n")
 
 
 if __name__ == "__main__":
