@@ -16,18 +16,26 @@ def set_seed(seed):
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
 
-def load_dat_file(filepath, expected_length=30452):
+def load_dat_file(filepath, expected_length=14113, is_complex=True):
     """
-    Reads raw binary float32 data from .dat file.
-    Adjust dtype if raw file uses float64 or int16.
+    Reads binary .dat files and computes magnitude if complex format is detected.
     """
     data = np.fromfile(filepath, dtype=np.float32)
+    
+    # Check if raw data contains interleaved IQ samples (2x expected length)
+    if is_complex and len(data) == 2 * expected_length:
+        i_samples = data[0::2]
+        q_samples = data[1::2]
+        # Calculate complex magnitude (envelope)
+        data = np.sqrt(i_samples**2 + q_samples**2)
+    
+    # Enforce exact array length
     if len(data) != expected_length:
-        # Fallback/padding/truncation if data size slightly deviates
         if len(data) > expected_length:
             data = data[:expected_length]
         else:
             data = np.pad(data, (0, expected_length - len(data)), 'constant')
+            
     return data
 
 def save_dat_file(filepath, data):
